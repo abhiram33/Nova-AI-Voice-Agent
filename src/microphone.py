@@ -1,9 +1,12 @@
 import audioop
+import io
 import logging
 import time
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
+import pyaudio
 import speech_recognition as sr
 
 logger = logging.getLogger(__name__)
@@ -154,44 +157,10 @@ def capture_audio(
 ) -> Optional[sr.AudioData]:
     """
     Record audio from the microphone and return an AudioData object.
-
-    Unlike ``listen()`` (which uses energy-gated voice activity detection
-    that is unreliable on certain Windows drivers), this function uses
-    ``record()`` to capture a fixed-duration clip.  Whisper handles
-    silence and noise internally, so VAD at the recording layer is
-    unnecessary.
-
-    The function:
-
-    1. Picks a real physical microphone (not "Sound Mapper").
-    2. Records *duration* seconds of audio.
-    3. Computes the RMS energy of the recording.  If it is below
-       *energy_threshold* the audio is treated as silence and ``None``
-       is returned.  A diagnostic WAV is still saved to
-       ``output/debug_ambient.wav`` for debugging.
-
-    Parameters
-    ----------
-    duration : float
-        Fixed recording length in seconds (default 8).
-    phrase_time_limit : float or None
-        **Ignored** (present only for API compatibility).
-    device_index : int or None
-        Index of the microphone to use.  ``None`` auto-selects the best
-        physical microphone via ``pick_best_microphone()``.
-    energy_threshold : int
-        Minimum RMS energy below which the recording is considered
-        silence and discarded.  Default 100 (adjust if your mic is
-        very quiet or very sensitive).
-
-    Returns
-    -------
-    AudioData or None
-        ``None`` indicates the recorded audio was below the energy
-        threshold (likely silence).  A debug WAV is saved to
-        ``output/debug_ambient.wav`` for analysis.
+    Uses ``pyaudio.paInt32`` directly because the Intel Smart Sound
+    microphone array produces corrupted audio under ``paInt16``.
     """
-    del phrase_time_limit  # unused — record() captures a fixed window
+    del phrase_time_limit
 
     global _SILENCE_DEVICE_INDEXES
 
@@ -202,86 +171,105 @@ def capture_audio(
     while attempts < max_attempts:
         attempts += 1
 
-        # Resolve the device index to try on this attempt.
         if idx is None and attempts == 1:
             best = pick_best_microphone()
             if best is None:
                 return None
             idx = best["index"]
 
-        # Skip indexes already known to produce silence.
         if idx in _SILENCE_DEVICE_INDEXES:
-            logger.info(
-                "Skipping previously-silent device [%d], trying next ...", idx
-            )
+            logger.info("Skipping previously-silent device [%d], trying next ...", idx)
             idx = _next_device(idx)
             continue
 
-        recognizer = sr.Recognizer()
-        recognizer.energy_threshold = energy_threshold
-        recognizer.dynamic_energy_threshold = False
+        if idx is None:
+            logger.error("No device index available.")
+            return None
 
-        mic = get_microphone(idx)
-        if mic is None:
-            idx = _next_device(idx)
-            continue
-
-        mic_name = sr.Microphone.list_microphone_names()[mic.device_index]
+        mic_name = sr.Microphone.list_microphone_names()[idx] if 0 <= idx < len(sr.Microphone.list_microphone_names()) else f"device_{idx}"
         logger.info("")
-        logger.info("Attempt %d/%d - microphone [%d] %s",
-                     attempts, max_attempts, mic.device_index, mic_name)
+        logger.info("Attempt %d/%d - microphone [%d] %s", attempts, max_attempts, idx, mic_name)
         logger.info("Recording %.1f s of audio ...", duration)
 
-        try:
-            with mic as source:
-                # Warm-up: Intel Smart Sound mic array returns silence on the
-                # first read.  Discard a short initial recording.
-                logger.debug("Warming up microphone ...")
-                recognizer.record(source, duration=0.3)
-                logger.info("Recording for %.1f seconds ...", duration)
-                audio = recognizer.record(source, duration=duration)
-        except (OSError, AttributeError) as exc:
-            logger.error("Microphone error during capture: %s", exc)
+        audio = _capture_pa32(idx, duration)
+        if audio is None:
             idx = _next_device(idx)
             continue
 
-        # --- Compute RMS energy (diagnostic only — no rejection) -----------
         rms = _rms(audio)
         dur = len(audio.frame_data) / audio.sample_width / audio.sample_rate
-        logger.info(
-            "Captured %d bytes @ %d Hz (%.1f s)  RMS=%.1f",
-            len(audio.frame_data), audio.sample_rate, dur, rms,
-        )
+        logger.info("Captured %d bytes @ %d Hz (%.1f s)  RMS=%.1f",
+                     len(audio.frame_data), audio.sample_rate, dur, rms)
 
-        # --- Zero-signal detection -----------------------------------------
         if rms == 0.0:
-            logger.warning(
-                "Audio RMS is 0.0 — device [%d] returned pure silence. "
-                "This indicates a Windows privacy/permissions issue.",
-                idx,
-            )
+            logger.warning("Audio RMS is 0.0 — device [%d] returned pure silence.", idx)
             save_audio(audio, "output/debug_last_capture.wav")
             _SILENCE_DEVICE_INDEXES.append(idx)
             logger.warning(
                 "Troubleshooting (Windows 11):\n"
                 "  1. Settings > Privacy & security > Microphone\n"
                 "     -> Enable 'Let apps access your microphone'\n"
-                "  2. Scroll to 'Let desktop apps access your microphone'\n"
-                "     -> Ensure Python / your terminal app is allowed.\n"
-                "  3. Settings > System > Sound > Input\n"
-                "     -> Select the correct mic and check it's not muted.\n"
-                "  A debug WAV was saved to output/debug_last_capture.wav —\n"
-                "  if it's silent audio, the OS is blocking the signal."
+                "  2. Ensure Python / your terminal app is allowed.\n"
+                "  3. Settings > System > Sound > Input: select correct mic.\n"
+                "  Debug WAV saved to output/debug_last_capture.wav"
             )
             idx = _next_device(idx)
             continue
 
-        # --- Audio captured successfully ----------------------------------
         logger.info("Audio captured (RMS=%.1f).", rms)
         return audio
 
     logger.error("All %d microphone attempts failed.", max_attempts)
     return None
+
+
+def _capture_pa32(device_index: int, duration: float) -> Optional[sr.AudioData]:
+    """
+    Capture audio using ``pyaudio.paInt32`` format.
+    Converts int32 samples to int16 for compatibility with the rest of the pipeline.
+    """
+    sample_rate = 16000
+    chunk = 1024
+    warmup_sec = 0.5
+
+    try:
+        p = pyaudio.PyAudio()
+        stream = p.open(
+            format=pyaudio.paInt32,
+            channels=1,
+            rate=sample_rate,
+            input=True,
+            input_device_index=device_index,
+            frames_per_buffer=chunk,
+        )
+    except Exception as exc:
+        logger.error("Failed to open PyAudio stream [%d]: %s", device_index, exc)
+        return None
+
+    try:
+        warmup_frames = int(sample_rate / chunk * warmup_sec)
+        for _ in range(warmup_frames):
+            stream.read(chunk, exception_on_overflow=False)
+
+        frames = b''
+        needed = int(sample_rate / chunk * duration)
+        for _ in range(needed):
+            data = stream.read(chunk, exception_on_overflow=False)
+            frames += data
+    except Exception as exc:
+        logger.error("Error during capture [%d]: %s", device_index, exc)
+        stream.close()
+        p.terminate()
+        return None
+
+    stream.close()
+    p.terminate()
+
+    float32_samples = np.frombuffer(frames, dtype=np.int32).astype(np.float64) / 2147483648.0
+    int16_samples = (float32_samples * 32767).astype(np.int16)
+    frame_data = int16_samples.tobytes()
+
+    return sr.AudioData(frame_data, sample_rate, 2)
 
 
 def _next_device(current_idx: int) -> Optional[int]:

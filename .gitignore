@@ -29,5 +29,8 @@ Thumbs.db
 # Generated audio files
 output/
 
+# Debug scripts
+debug_*.py
+
 # Logs
 *.log

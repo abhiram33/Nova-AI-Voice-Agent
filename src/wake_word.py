@@ -3,9 +3,7 @@ import threading
 import time
 from typing import Callable, Optional
 
-import speech_recognition as sr
-
-from src.microphone import pick_best_microphone, _rms
+from src.microphone import pick_best_microphone, _rms, _capture_pa32
 from src.stt import SpeechToText
 
 logger = logging.getLogger(__name__)
@@ -119,56 +117,28 @@ class WakeWordDetector:
 
     def _run(self) -> None:
         """Main loop — runs in a daemon thread."""
-        recognizer = sr.Recognizer()
-        recognizer.energy_threshold = self.energy_threshold
-        recognizer.dynamic_energy_threshold = False
-        recognizer.pause_threshold = 0.5
-
-        # Calibrate once at startup (discards first-silence warm-up).
-        try:
-            with sr.Microphone(device_index=self._mic_index, sample_rate=16000) as source:
-                recognizer.record(source, duration=0.3)  # warm-up
-                logger.info("Calibrating wake word detector for ambient noise ...")
-                recognizer.adjust_for_ambient_noise(source, duration=1.0)
-                logger.info(
-                    "Wake word energy threshold: %d",
-                    recognizer.energy_threshold,
-                )
-        except (OSError, AttributeError) as exc:
-            logger.error("Wake word mic calibration failed: %s", exc)
-            self._running = False
-            return
+        logger.info(
+            "Wake word detector using paInt32 @ 16 kHz (energy_threshold=%d)",
+            self.energy_threshold,
+        )
 
         while self._running:
-            # Block while paused (mic is free for the pipeline).
             self._pause_event.wait()
 
-            try:
-                with sr.Microphone(device_index=self._mic_index, sample_rate=16000) as source:
-                    audio = recognizer.listen(
-                        source,
-                        timeout=self.listen_timeout,
-                        phrase_time_limit=self.chunk_duration,
-                    )
-            except sr.WaitTimeoutError:
-                continue  # no speech in this window
-            except (OSError, AttributeError) as exc:
-                logger.error("Wake word listen error: %s", exc)
+            audio = _capture_pa32(self._mic_index, self.chunk_duration)
+            if audio is None:
                 time.sleep(0.5)
                 continue
 
-            # Quick energy gate — skip obvious silence without an API call.
             rms = _rms(audio)
             if rms < self.energy_threshold:
                 continue
 
-            # Rate limit — don't hit Groq Whisper API more than once per cooldown.
             now = time.monotonic()
             if now - self._last_transcribe_time < self._cooldown:
                 continue
             self._last_transcribe_time = now
 
-            # Transcribe via Groq Whisper.
             try:
                 text = self._stt.transcribe(audio)
             except Exception as exc:
@@ -181,8 +151,6 @@ class WakeWordDetector:
             logger.debug("Wake word detector heard: %s", text.strip())
 
             if self.wake_word in text.lower().strip():
-                logger.info(
-                    "Wake word '%s' detected in: %s", self.wake_word, text.strip()
-                )
+                logger.info("Wake word '%s' detected in: %s", self.wake_word, text.strip())
                 if self.on_wake:
                     self.on_wake()
