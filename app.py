@@ -359,6 +359,10 @@ with st.sidebar:
         label_visibility="collapsed",
         key="mic_index",
     )
+    if st.session_state.pipeline.device_index != mic_index:
+        st.session_state.pipeline.device_index = mic_index
+        if st.session_state.get("wake_detector"):
+            st.session_state.wake_detector._mic_index = mic_index
 
     st.markdown('<div class="settings-label">Wake Word</div>',
                 unsafe_allow_html=True)

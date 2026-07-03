@@ -1,4 +1,5 @@
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -167,7 +168,7 @@ class VoicePipeline:
                 error="No speech detected or microphone unavailable.",
             )
 
-        audio_path = f"output/turn_{id(audio)}.wav"
+        audio_path = f"output/turn_{time.time_ns()}.wav"
         save_audio(audio, audio_path)
         save_audio(audio, "output/last_recording.wav")
 

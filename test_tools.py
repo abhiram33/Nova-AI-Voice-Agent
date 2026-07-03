@@ -111,7 +111,7 @@ def test_get_weather():
         print(f"  SKIP (network may be unavailable): {exc}")
         return True
 
-    ok = bool(result) and "°C" in result and "London" in result
+    ok = bool(result) and "°C" in result and "humidity" in result
     print(f"  Result: {result}")
     print(f"  {'OK' if ok else 'FAIL'}")
     return ok

@@ -160,7 +160,8 @@ def capture_audio(
     Uses ``pyaudio.paInt32`` directly because the Intel Smart Sound
     microphone array produces corrupted audio under ``paInt16``.
     """
-    del phrase_time_limit
+    if phrase_time_limit is not None:
+        duration = phrase_time_limit
 
     global _SILENCE_DEVICE_INDEXES
 
